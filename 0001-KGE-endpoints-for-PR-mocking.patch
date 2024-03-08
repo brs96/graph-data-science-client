@@ -1,0 +1,164 @@
+From 3a863151ec8459fce186ce9b7492c4d53498ba7e Mon Sep 17 00:00:00 2001
+From: Adam Schill Collberg <adam.schill.collberg@protonmail.com>
+Date: Tue, 9 Jan 2024 15:35:19 +0100
+Subject: [PATCH] KGE endpoints for PR mocking
+
+---
+ graphdatascience/endpoints.py        |   2 +
+ graphdatascience/model/kge_runner.py | 124 +++++++++++++++++++++++++++
+ 2 files changed, 126 insertions(+)
+ create mode 100644 graphdatascience/model/kge_runner.py
+
+diff --git a/graphdatascience/endpoints.py b/graphdatascience/endpoints.py
+index 16265c2..96d3800 100644
+--- a/graphdatascience/endpoints.py
++++ b/graphdatascience/endpoints.py
+@@ -4,6 +4,7 @@ from .algo.single_mode_algo_endpoints import (
+ )
+ from .call_builder import IndirectAlphaCallBuilder, IndirectBetaCallBuilder
+ from .graph.graph_endpoints import GraphAlphaEndpoints, GraphBetaEndpoints
++from .model.kge_runner import KGEEndpoints
+ from .model.model_endpoints import (
+     ModelAlphaEndpoints,
+     ModelBetaEndpoints,
+@@ -38,6 +39,7 @@ class DirectEndpoints(
+     PipelineEndpoints,
+     ModelEndpoints,
+     ConfigEndpoints,
++    KGEEndpoints,
+ ):
+     def __init__(self, query_runner: QueryRunner, namespace: str, server_version: ServerVersion):
+         super().__init__(query_runner, namespace, server_version)
+diff --git a/graphdatascience/model/kge_runner.py b/graphdatascience/model/kge_runner.py
+new file mode 100644
+index 0000000..f971421
+--- /dev/null
++++ b/graphdatascience/model/kge_runner.py
+@@ -0,0 +1,124 @@
++import logging
++import time
++from typing import Any, Dict, Optional, Tuple
++
++import pyarrow as pa
++import pyarrow.flight
++import requests
++from pandas import DataFrame
++
++from ..caller_base import CallerBase
++from ..error.client_only_endpoint import client_only_endpoint
++from ..error.illegal_attr_checker import IllegalAttrChecker
++from ..error.uncallable_namespace import UncallableNamespace
++from ..graph.graph_object import Graph
++from ..server_version.compatible_with import compatible_with
++from ..server_version.server_version import ServerVersion
++
++logging.basicConfig(level=logging.INFO)
++
++DUMMY_USER_NAME = "DUMMY_USER"
++
++
++class KGERunner(UncallableNamespace, IllegalAttrChecker):
++    # TODO: Replace with correct URIs
++    _AURA_CONSOLE_BASE_URI = "http://localhost:5000"
++    _AURA_RESULT_STORE_URI = "grpc://0.0.0.0:8815"
++
++    @compatible_with("stream", min_inclusive=ServerVersion(2, 5, 0))
++    @client_only_endpoint("gds.kge")
++    def stream(
++        self,
++        G: Graph,
++        model_name: str,
++        training_config: Dict[str, Any],
++        graph_filter: Optional[Dict[str, Any]] = None,
++        wandb: Optional[Dict[str, Any]] = None,
++    ) -> Tuple[Dict[str, Any], DataFrame]:
++        graph_config = {"name": G.name()}
++        if graph_filter is not None:
++            graph_config.update(graph_filter)
++
++        config = {
++            "user_name": "DUMMY_USER",
++            "task": "KGE_TRAINING",
++            "task_config": {
++                "graph_config": graph_config,
++                "model_name": model_name,
++                "training_config": training_config,
++                "stream_node_results": True,
++            },
++        }
++        if wandb is not None:
++            config["task_config"]["wandb"] = wandb
++
++        job_id = self._start_training_job(config)
++
++        metadata = self._check_job_status(job_id)
++        embeddings = self._stream_results(job_id)
++
++        return metadata, embeddings
++
++    @compatible_with("list", min_inclusive=ServerVersion(2, 5, 0))
++    @client_only_endpoint("gds.kge")
++    def list(self) -> DataFrame:
++        res = requests.get(f"{KGERunner._AURA_CONSOLE_BASE_URI}/api/machine-learning/list")
++        res.raise_for_status()
++
++        return DataFrame(res.json())
++
++    @compatible_with("delete", min_inclusive=ServerVersion(2, 5, 0))
++    @client_only_endpoint("gds.kge")
++    def delete(self, model_name: str) -> None:
++        payload = {"user_name": DUMMY_USER_NAME, "model_name": model_name}
++        res = requests.post(f"{KGERunner._AURA_CONSOLE_BASE_URI}/api/machine-learning/delete", json=payload)
++        res.raise_for_status()
++
++    @staticmethod
++    def _start_training_job(config: Dict[str, Any]) -> str:
++        res = requests.post(f"{KGERunner._AURA_CONSOLE_BASE_URI}/api/machine-learning/start", json=config)
++        res.raise_for_status()
++        job_id = res.json()["job_id"]
++        logging.info(f"Job with ID '{job_id}' started")
++
++        return job_id
++
++    @staticmethod
++    def _check_job_status(job_id: str) -> Dict[str, Any]:
++        ONE_MINUTE = 60
++
++        t = 0
++        while t < ONE_MINUTE:
++            time.sleep(1)
++
++            res = requests.get(f"{KGERunner._AURA_CONSOLE_BASE_URI}/api/machine-learning/status/{job_id}")
++            res.raise_for_status()
++
++            res_json = res.json()
++            logging.info(res_json)
++
++            if res_json["job_status"] == "exited":
++                assert res_json["metadata"]["metrics"]["hits@10"] >= 0
++                logging.info("Training job completed!")
++                return res_json["metadata"]
++
++            t += 1
++
++        raise RuntimeError("Training job did not complete within one minute's time")
++
++    @staticmethod
++    def _stream_results(job_id: str) -> DataFrame:
++        client = pa.flight.connect(KGERunner._AURA_RESULT_STORE_URI)
++
++        upload_descriptor = pa.flight.FlightDescriptor.for_path(f"{job_id}.nodes")
++        flight = client.get_flight_info(upload_descriptor)
++        reader = client.do_get(flight.endpoints[0].ticket)
++        read_table = reader.read_all()
++
++        return read_table.to_pandas()
++
++
++class KGEEndpoints(CallerBase):
++    @property
++    def kge(self) -> KGERunner:
++        return KGERunner(self._query_runner, f"{self._namespace}.kge", self._server_version)
+-- 
+2.39.3 (Apple Git-145)
+
